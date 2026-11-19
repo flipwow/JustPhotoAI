@@ -288,11 +288,9 @@ recent_prompts: dict[int, tuple[str, float]] = {}
 tracked_chat_messages: dict[int, set[int]] = {}
 
 
-async def track_bot_messages(
-    handler: Any, bot_instance: Bot, method: Any, data: dict[str, Any]
-) -> Any:
+async def track_bot_messages(handler: Any, bot_instance: Bot, method: Any) -> Any:
+    result = await handler(bot_instance, method)
 
-    result = await handler(bot_instance, method, data)
     if isinstance(result, Message):
         tracked_chat_messages.setdefault(result.chat.id, set()).add(result.message_id)
     return result
