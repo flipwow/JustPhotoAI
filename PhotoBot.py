@@ -11,6 +11,7 @@ import base64
 import binascii
 import hashlib
 import logging
+import os
 import time
 import uuid
 
@@ -18,7 +19,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import aiosqlite
+from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, Router
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message
@@ -48,6 +51,9 @@ TARIFFS: dict[str, dict[str, Any]] = {
 
 MAX_PROMPT_LENGTH = 2000
 DUPLICATE_PROMPT_WINDOW_SECONDS = 5.0
+WEBHOOK_PATH = "/telegram/webhook"
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -466,26 +472,64 @@ dispatcher.include_router(router)
 dispatcher.message.middleware(AccessMiddleware())
 
 
-async def main() -> None:
+async def health_handler(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+
+async def on_startup(app: web.Application) -> None:
     global client
+    if not WEBHOOK_SECRET:
+        raise RuntimeError("Set the WEBHOOK_SECRET environment variable")
+    hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    webhook_url = os.environ.get("WEBHOOK_URL")
+    if not webhook_url:
+        if not hostname:
+            raise RuntimeError(
+                "Set RENDER_EXTERNAL_HOSTNAME or WEBHOOK_URL for webhook mode"
+            )
+        webhook_url = f"https://{hostname}{WEBHOOK_PATH}"
+
     await database.initialize()
     client = AsyncOpenAI(
         api_key=PROXYAPI_KEY,
         base_url=PROXYAPI_BASE_URL,
         timeout=180.0,
     )
-    try:
-        await dispatcher.start_polling(bot)
-    finally:
-        if client is not None:
-            await client.close()
-            client = None
-        await database.close()
-        await bot.session.close()
+    await bot.set_webhook(
+        url=webhook_url,
+        secret_token=WEBHOOK_SECRET,
+        allowed_updates=dispatcher.resolve_used_update_types(),
+    )
+    logger.info("Telegram webhook configured; HTTP server is ready")
+
+
+async def on_cleanup(app: web.Application) -> None:
+    global client
+    if client is not None:
+        await client.close()
+        client = None
+    await database.close()
+    await bot.session.close()
+
+
+def create_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    SimpleRequestHandler(
+        dispatcher=dispatcher,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+    ).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dispatcher, bot=bot)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
+
+
+def main() -> None:
+    port = int(os.environ.get("PORT", "10000"))
+    web.run_app(create_app(), host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("PhotoBot stopped")
+    main()
