@@ -259,6 +259,8 @@ class AccessMiddleware(BaseMiddleware):
 
     async def __call__(self, handler: Any, event: Any, data: dict[str, Any]) -> Any:
         user = getattr(event, "from_user", None)
+        if isinstance(event, Message):
+            tracked_chat_messages.setdefault(event.chat.id, set()).add(event.message_id)
         if user is not None and user.id not in ALLOWED_USERS:
             if isinstance(event, Message):
                 await event.answer("⛔ Доступ запрещён")
@@ -283,9 +285,21 @@ database: DatabaseBackend = SQLiteDatabase(DATABASE_PATH)
 client: AsyncOpenAI | None = None
 user_locks: dict[int, asyncio.Lock] = {}
 recent_prompts: dict[int, tuple[str, float]] = {}
+tracked_chat_messages: dict[int, set[int]] = {}
+
+
+async def track_bot_messages(
+    handler: Any, bot_instance: Bot, method: Any, data: dict[str, Any]
+) -> Any:
+
+    result = await handler(bot_instance, method, data)
+    if isinstance(result, Message):
+        tracked_chat_messages.setdefault(result.chat.id, set()).add(result.message_id)
+    return result
 
 
 async def _ensure_database_user(message: Message) -> None:
+
     if message.from_user is not None:
         await database.ensure_user(message.from_user.id, message.from_user.username)
 
@@ -296,7 +310,7 @@ async def start_handler(message: Message) -> None:
     await message.answer(
         "Привет! Я PhotoBot и создаю изображения по текстовому описанию.\n"
         "Отправьте описание (до 2000 символов), чтобы сгенерировать изображение.\n"
-        "Команды: /help — инструкция, /id — ваш Telegram ID, /clear — очистить временное состояние."
+        "Команды: /help — инструкция, /id — ваш Telegram ID, /clear — удалить сообщения, доступные боту."
     )
 
 
@@ -306,7 +320,8 @@ async def help_handler(message: Message) -> None:
     await message.answer(
         "Отправьте текстовое описание изображения — бот сгенерирует его.\n"
         "Максимальная длина описания: 2000 символов.\n"
-        "/start — приветствие, /help — помощь, /id — ваш Telegram ID, /clear — очистка временного состояния.\n"
+        "/start — приветствие, /help — помощь, /id — ваш Telegram ID, /clear — удалить сообщения, доступные боту.\n"
+        "Очистка действует на сообщения, полученные или отправленные ботом с момента его запуска; Telegram ограничивает удаление старых сообщений.\n"
         "Для обработки изображения отправьте фото с текстом в подписи."
     )
 
@@ -322,11 +337,23 @@ async def id_handler(message: Message) -> None:
 async def clear_handler(message: Message) -> None:
     if message.from_user is None:
         return
-        # Контекст диалога не хранится; не сбрасываем антидубликатную защиту.
-    await message.answer(
-        "Контекст диалога не хранится: каждый запрос обрабатывается отдельно. "
-        "История генераций и баланс не изменены."
-    )
+
+    # Сбрасываем антидубликатную защиту для пользователя.
+    recent_prompts.pop(message.from_user.id, None)
+
+    # Telegram Bot API не позволяет получить список всей истории чата, поэтому
+    # удаляем все сообщения, ID которых бот видел в течение текущего запуска.
+    message_ids = tracked_chat_messages.pop(message.chat.id, set())
+    message_ids.add(message.message_id)
+    for message_id in message_ids:
+        try:
+            await bot.delete_message(message.chat.id, message_id)
+        except Exception:
+            logger.debug(
+                "Could not delete chat message (chat_id=%s, message_id=%s)",
+                message.chat.id,
+                message_id,
+            )
 
 
 def _error_code(exc: Exception) -> str:
@@ -520,6 +547,7 @@ async def generate_handler(message: Message) -> None:
 
 dispatcher.include_router(router)
 dispatcher.message.middleware(AccessMiddleware())
+bot.session.middleware.register(track_bot_messages)
 
 
 async def health_handler(request: web.Request) -> web.Response:
