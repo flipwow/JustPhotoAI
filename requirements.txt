@@ -3,3 +3,5 @@ python-dotenv
 aiogram
 aiohttp
 google-generativeai
+aiosqlite
+openai
