@@ -1,0 +1,5 @@
+pyTelegramBotAPI
+python-dotenv
+aiogram
+aiohttp
+google-generativeai
