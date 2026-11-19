@@ -12,6 +12,7 @@ import binascii
 import hashlib
 import logging
 import os
+import secrets
 import time
 import uuid
 
@@ -52,7 +53,7 @@ TARIFFS: dict[str, dict[str, Any]] = {
 MAX_PROMPT_LENGTH = 2000
 DUPLICATE_PROMPT_WINDOW_SECONDS = 5.0
 WEBHOOK_PATH = "/telegram/webhook"
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET") or secrets.token_urlsafe(32)
 
 
 logging.basicConfig(
@@ -476,35 +477,61 @@ async def health_handler(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
-async def on_startup(app: web.Application) -> None:
+async def initialize_bot(app: web.Application) -> None:
+    """Подключается к БД и Telegram в фоне, чтобы HTTP-порт открылся сразу."""
     global client
-    if not WEBHOOK_SECRET:
-        raise RuntimeError("Set the WEBHOOK_SECRET environment variable")
-    hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-    webhook_url = os.environ.get("WEBHOOK_URL")
-    if not webhook_url:
-        if not hostname:
-            raise RuntimeError(
-                "Set RENDER_EXTERNAL_HOSTNAME or WEBHOOK_URL for webhook mode"
+    while True:
+        try:
+            if database.connection is None:
+                await database.initialize()
+            if client is None:
+                client = AsyncOpenAI(
+                    api_key=PROXYAPI_KEY,
+                    base_url=PROXYAPI_BASE_URL,
+                    timeout=180.0,
+                )
+            hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+            webhook_url = os.environ.get("WEBHOOK_URL")
+            if not webhook_url:
+                if not hostname:
+                    raise RuntimeError("missing_public_webhook_hostname")
+                webhook_url = f"https://{hostname}{WEBHOOK_PATH}"
+            await bot.set_webhook(
+                url=webhook_url,
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=dispatcher.resolve_used_update_types(),
             )
-        webhook_url = f"https://{hostname}{WEBHOOK_PATH}"
+            logger.info("Telegram webhook configured")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Не логируем текст исключения: в нём не должны появиться секреты.
+            logger.error(
+                "Webhook initialization failed (error_type=%s); retrying in 10 seconds",
+                type(exc).__name__,
+            )
+            if client is not None:
+                await client.close()
+                client = None
+            if database.connection is not None:
+                await database.close()
+            await asyncio.sleep(10)
 
-    await database.initialize()
-    client = AsyncOpenAI(
-        api_key=PROXYAPI_KEY,
-        base_url=PROXYAPI_BASE_URL,
-        timeout=180.0,
-    )
-    await bot.set_webhook(
-        url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
-        allowed_updates=dispatcher.resolve_used_update_types(),
-    )
-    logger.info("Telegram webhook configured; HTTP server is ready")
+
+async def on_startup(app: web.Application) -> None:
+    app["bot_initialization_task"] = asyncio.create_task(initialize_bot(app))
 
 
 async def on_cleanup(app: web.Application) -> None:
     global client
+    task = app.get("bot_initialization_task")
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     if client is not None:
         await client.close()
         client = None
@@ -515,6 +542,7 @@ async def on_cleanup(app: web.Application) -> None:
 def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", health_handler)
+
     SimpleRequestHandler(
         dispatcher=dispatcher,
         bot=bot,
