@@ -10,6 +10,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
+from io import BytesIO
 import logging
 import os
 import secrets
@@ -51,6 +52,7 @@ TARIFFS: dict[str, dict[str, Any]] = {
 }
 
 MAX_PROMPT_LENGTH = 2000
+MAX_REFERENCE_PHOTO_BYTES = 20 * 1024 * 1024
 DUPLICATE_PROMPT_WINDOW_SECONDS = 5.0
 WEBHOOK_PATH = "/telegram/webhook"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET") or secrets.token_urlsafe(32)
@@ -294,7 +296,7 @@ async def start_handler(message: Message) -> None:
     await message.answer(
         "Привет! Я PhotoBot и создаю изображения по текстовому описанию.\n"
         "Отправьте описание (до 2000 символов), чтобы сгенерировать изображение.\n"
-        "Команды: /help — инструкция, /id — ваш Telegram ID."
+        "Команды: /help — инструкция, /id — ваш Telegram ID, /clear — очистить временное состояние."
     )
 
 
@@ -304,7 +306,8 @@ async def help_handler(message: Message) -> None:
     await message.answer(
         "Отправьте текстовое описание изображения — бот сгенерирует его.\n"
         "Максимальная длина описания: 2000 символов.\n"
-        "/start — приветствие, /help — помощь, /id — ваш Telegram ID."
+        "/start — приветствие, /help — помощь, /id — ваш Telegram ID, /clear — очистка временного состояния.\n"
+        "Для обработки изображения отправьте фото с текстом в подписи."
     )
 
 
@@ -313,6 +316,17 @@ async def id_handler(message: Message) -> None:
     if message.from_user is not None:
         await _ensure_database_user(message)
         await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
+
+
+@router.message(Command("clear"))
+async def clear_handler(message: Message) -> None:
+    if message.from_user is None:
+        return
+        # Контекст диалога не хранится; не сбрасываем антидубликатную защиту.
+    await message.answer(
+        "Контекст диалога не хранится: каждый запрос обрабатывается отдельно. "
+        "История генераций и баланс не изменены."
+    )
 
 
 def _error_code(exc: Exception) -> str:
@@ -331,17 +345,35 @@ def _error_code(exc: Exception) -> str:
 @router.message()
 async def generate_handler(message: Message) -> None:
     global client
-    if message.from_user is None or not message.text:
+    if message.from_user is None:
         return
 
-    user_id = message.from_user.id
-    user_prompt = message.text.strip()
+    reference_photo = message.photo[-1] if message.photo else None
+    if reference_photo is not None:
+        user_prompt = (message.caption or "").strip()
+        if not user_prompt:
+            await message.answer(
+                "Добавьте описание в подпись к фото, например: «Сделай фон зимним»."
+            )
+            return
+        if (
+            reference_photo.file_size is not None
+            and reference_photo.file_size > MAX_REFERENCE_PHOTO_BYTES
+        ):
+            await message.answer("Фото слишком большое. Максимальный размер — 20 МБ.")
+            return
+    else:
+        if not message.text:
+            return
+        user_prompt = message.text.strip()
+
     if not user_prompt:
         return
     if len(user_prompt) > MAX_PROMPT_LENGTH:
         await message.answer("Промт слишком длинный. Максимум — 2000 символов.")
         return
 
+    user_id = message.from_user.id
     await _ensure_database_user(message)
     lock = user_locks.setdefault(user_id, asyncio.Lock())
     if lock.locked():
@@ -390,12 +422,29 @@ async def generate_handler(message: Message) -> None:
         try:
             if client is None:
                 raise RuntimeError("Image client is not initialized")
+
             await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-            response = await client.images.generate(
-                model=IMAGE_MODEL,
-                prompt=user_prompt,
-                n=1,
-            )
+            if reference_photo is not None:
+                downloaded = await bot.download(reference_photo.file_id)
+                if downloaded is None:
+                    raise ValueError("Could not download reference photo")
+                reference_bytes = downloaded.getvalue()
+                if not reference_bytes:
+                    raise ValueError("Reference photo is empty")
+                if len(reference_bytes) > MAX_REFERENCE_PHOTO_BYTES:
+                    raise ValueError("Reference photo exceeds size limit")
+                response = await client.images.edit(
+                    model=IMAGE_MODEL,
+                    prompt=user_prompt,
+                    image=("reference.jpg", BytesIO(reference_bytes), "image/jpeg"),
+                    n=1,
+                )
+            else:
+                response = await client.images.generate(
+                    model=IMAGE_MODEL,
+                    prompt=user_prompt,
+                    n=1,
+                )
             if not response.data or not response.data[0].b64_json:
                 raise ValueError("Image response is empty")
 
