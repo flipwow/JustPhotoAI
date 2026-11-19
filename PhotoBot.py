@@ -354,8 +354,53 @@ async def clear_handler(message: Message) -> None:
             )
 
 
+def _is_content_policy_error(exc: Exception) -> bool:
+    if not isinstance(exc, APIStatusError):
+        return False
+    details = f"{exc} {exc.body}".casefold()
+    return any(
+        marker in details
+        for marker in (
+            "content_policy_violation",
+            "content policy",
+            "safety system",
+            "moderation",
+        )
+    )
+
+
+async def _update_generation_progress(status_message: Message) -> None:
+    started_at = time.monotonic()
+    last_percent = 0
+    try:
+        while True:
+            await asyncio.sleep(5)
+            elapsed = time.monotonic() - started_at
+            # ProxyAPI не предоставляет реальный прогресс, это приблизительная оценка.
+            percent = min(95, int(100 * elapsed / (elapsed + 45)))
+            if percent > last_percent:
+                await status_message.edit_text(
+                    f"🎨 Создаю изображение... {percent}%\n"
+                    "Процент приблизительный: модель не сообщает точный прогресс."
+                )
+                last_percent = percent
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("Could not update generation progress message")
+
+
+async def _stop_generation_progress(task: asyncio.Task[None]) -> None:
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 def _error_code(exc: Exception) -> str:
     """Нейтральный код для БД и логов, без токенов/ответов ProxyAPI."""
+
     if isinstance(exc, (APITimeoutError, asyncio.TimeoutError)):
         return "timeout"
     if isinstance(exc, APIConnectionError):
@@ -439,13 +484,19 @@ async def generate_handler(message: Message) -> None:
         if BILLING_ENABLED and not is_admin and not await database.has_credit(user_id):
             await message.answer("Недостаточно кредитов для генерации.")
             return
-        recent_prompts[user_id] = (prompt_hash, time.monotonic())
+        recent_prompts[user_id] = (prompt_hash, time.monotonic())  # remember prompt
+
         request_id = str(uuid.uuid4())
+
         status_message = await message.answer(
-            "🎨 Создаю изображение, пожалуйста, подождите..."
+            "🎨 Создаю изображение... 5%\n"
+            "Процент приблизительный: модель не сообщает точный прогресс."
         )
+        progress_task = asyncio.create_task(_update_generation_progress(status_message))
+
         try:
             if client is None:
+
                 raise RuntimeError("Image client is not initialized")
 
             await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
@@ -464,6 +515,7 @@ async def generate_handler(message: Message) -> None:
                     image=("reference.jpg", BytesIO(reference_bytes), "image/jpeg"),
                     n=1,
                 )
+
             else:
                 response = await client.images.generate(
                     model=IMAGE_MODEL,
@@ -471,32 +523,42 @@ async def generate_handler(message: Message) -> None:
                     n=1,
                 )
             if not response.data or not response.data[0].b64_json:
+
                 raise ValueError("Image response is empty")
 
             image_bytes = base64.b64decode(response.data[0].b64_json, validate=True)
+
             if not image_bytes:
                 raise ValueError("Decoded image is empty")
+            await _stop_generation_progress(progress_task)
             image = BufferedInputFile(image_bytes, filename="photobot.png")
+
             await database.complete_generation(
                 request_id, user_id, user_prompt, is_admin
             )
             caption = user_prompt[:1024]
             await message.answer_photo(image, caption=caption)
+
             if len(user_prompt) > 1024:
                 await message.answer(user_prompt)
             try:
                 await status_message.delete()
             except Exception:
+
                 logger.warning(
                     "Could not delete progress message (user_id=%s)", user_id
                 )
         except InsufficientCredits:
+            await _stop_generation_progress(progress_task)
+
             await database.record_failure(
                 request_id, user_id, user_prompt, "insufficient_credits"
             )
+
             await message.answer("Недостаточно кредитов для генерации.")
             try:
                 await status_message.delete()
+
             except Exception:
                 pass
         except (
@@ -508,37 +570,59 @@ async def generate_handler(message: Message) -> None:
             binascii.Error,
             RuntimeError,
         ) as exc:
-            code = _error_code(exc)
+
+            await _stop_generation_progress(progress_task)
+            policy_violation = _is_content_policy_error(exc)
+
+            code = "content_policy_violation" if policy_violation else _error_code(exc)
             logger.warning(
                 "Image generation failed (user_id=%s, code=%s)", user_id, code
             )
+
             try:
                 await database.record_failure(request_id, user_id, user_prompt, code)
+
             except Exception:
                 logger.exception(
                     "Could not record generation failure (user_id=%s)", user_id
                 )
-            await message.answer(
-                "Не удалось создать изображение из-за временной ошибки. Попробуйте позже."
-            )
+            if policy_violation:
+
+                await message.answer(
+                    "Не удалось создать изображение: запрос может нарушать правила "
+                    "генерации контента. Измените описание и попробуйте снова."
+                )
+
+            else:
+                await message.answer(
+                    "Не удалось создать изображение из-за временной ошибки. Попробуйте позже."
+                )
             try:
                 await status_message.delete()
+
             except Exception:
                 pass
         except Exception as exc:
+
+            await _stop_generation_progress(progress_task)
+
             code = _error_code(exc)
+
             logger.error(
                 "Unexpected generation error (user_id=%s, code=%s)", user_id, code
             )
             try:
                 await database.record_failure(request_id, user_id, user_prompt, code)
+
             except Exception:
                 logger.exception(
                     "Could not record generation failure (user_id=%s)", user_id
                 )
+
             await message.answer("Не удалось обработать запрос. Попробуйте позже.")
             try:
                 await status_message.delete()
+
             except Exception:
                 pass
 
