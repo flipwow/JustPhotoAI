@@ -493,8 +493,10 @@ async def generate_handler(message: Message) -> None:
             "Процент приблизительный: модель не сообщает точный прогресс."
         )
         progress_task = asyncio.create_task(_update_generation_progress(status_message))
+        generation_started_at = time.monotonic()
 
         try:
+
             if client is None:
 
                 raise RuntimeError("Image client is not initialized")
@@ -575,8 +577,12 @@ async def generate_handler(message: Message) -> None:
             policy_violation = _is_content_policy_error(exc)
 
             code = "content_policy_violation" if policy_violation else _error_code(exc)
+
             logger.warning(
-                "Image generation failed (user_id=%s, code=%s)", user_id, code
+                "Image generation failed (user_id=%s, code=%s, elapsed_seconds=%.1f)",
+                user_id,
+                code,
+                time.monotonic() - generation_started_at,
             )
 
             try:
@@ -607,10 +613,13 @@ async def generate_handler(message: Message) -> None:
             await _stop_generation_progress(progress_task)
 
             code = _error_code(exc)
-
             logger.error(
-                "Unexpected generation error (user_id=%s, code=%s)", user_id, code
+                "Unexpected generation error (user_id=%s, code=%s, elapsed_seconds=%.1f)",
+                user_id,
+                code,
+                time.monotonic() - generation_started_at,
             )
+
             try:
                 await database.record_failure(request_id, user_id, user_prompt, code)
 
@@ -648,6 +657,7 @@ async def initialize_bot(app: web.Application) -> None:
                     api_key=PROXYAPI_KEY,
                     base_url=PROXYAPI_BASE_URL,
                     timeout=180.0,
+                    max_retries=0,
                 )
             webhook_url = os.environ.get("WEBHOOK_URL") or (
                 f"https://31-56-27-98.sslip.io{WEBHOOK_PATH}"
