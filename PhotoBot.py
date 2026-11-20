@@ -31,10 +31,10 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpe
 
 # Конфигурация
 BOT_TOKEN = "9051715873:AAF7yg49Pm8FM8SwgIVQDWe_cqGKF_rHikQ"
-PROXYAPI_KEY = "sk-y8pOLcyDWyuCHidk3Dch1yCqWlsdi0EH"
+PROXYAPI_KEY = "sk-lVhaC1ph2MTWqmY5PLEfTSlZYPO7cVte"
 ALLOWED_USERS = [8990488378]
 PROXYAPI_BASE_URL = "https://api.proxyapi.ru/v1"
-IMAGE_MODEL = "black-forest-labs/flux.2-klein-4b"
+IMAGE_MODEL = "tencent/hy-image-v3.5-preview"
 
 # Все разрешённые в этом списке пользователи — администраторы с безлимитным доступом.
 ADMIN_USERS = set(ALLOWED_USERS)
