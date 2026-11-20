@@ -649,12 +649,9 @@ async def initialize_bot(app: web.Application) -> None:
                     base_url=PROXYAPI_BASE_URL,
                     timeout=180.0,
                 )
-            hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-            webhook_url = os.environ.get("WEBHOOK_URL")
-            if not webhook_url:
-                if not hostname:
-                    raise RuntimeError("missing_public_webhook_hostname")
-                webhook_url = f"https://{hostname}{WEBHOOK_PATH}"
+            webhook_url = os.environ.get("WEBHOOK_URL") or (
+                f"https://31-56-27-98.sslip.io{WEBHOOK_PATH}"
+            )
             await bot.set_webhook(
                 url=webhook_url,
                 secret_token=WEBHOOK_SECRET,
